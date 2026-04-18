@@ -1,4 +1,11 @@
-"""S&P 500 market data client using yfinance + Wikipedia for constituents."""
+"""S&P 500 market data client using yfinance + multi-source constituents.
+
+Sources (in priority order):
+  1. datahub.io CSV (GitHub-hosted, stable, updated weekly)
+  2. Wikipedia (fallback)
+
+This removes the 403 Forbidden failure caused by Wikipedia's UA policy.
+"""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
@@ -14,14 +21,83 @@ from .models import StockMarket
 
 log = get_logger(__name__)
 
+# Primary: datahub.io (hosted on GitHub, auto-refreshed from Wikipedia)
+SP500_DATAHUB_URL = (
+    "https://raw.githubusercontent.com/datasets/"
+    "s-and-p-500-companies/main/data/constituents.csv"
+)
+# Secondary: Wikipedia
 SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-_WIKI_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"}
+
+# Wikimedia User-Agent policy: identify your tool + contact.
+# https://meta.wikimedia.org/wiki/User-Agent_policy
+_WIKI_HEADERS = {
+    "User-Agent": (
+        "sp500-research-agent/1.0 "
+        "(+https://github.com/jinhae8971/sp500-research-agent; "
+        "contact: github issues)"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_DATAHUB_HEADERS = {
+    "User-Agent": "sp500-research-agent/1.0 (github:jinhae8971)",
+}
+
+
+def _normalize_constituents_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize column names and ticker format across heterogeneous sources."""
+    col_map = {}
+    for c in df.columns:
+        cl = str(c).lower().strip()
+        if cl in ("symbol", "ticker"):
+            col_map[c] = "ticker"
+        elif cl in ("security", "company", "name"):
+            col_map[c] = "name"
+        elif "sector" in cl and "sub" not in cl:
+            col_map[c] = "sector"
+        elif "sub" in cl and ("industry" in cl or "sector" in cl):
+            col_map[c] = "sub_industry"
+    df = df.rename(columns=col_map)
+
+    if "ticker" not in df.columns:
+        raise RuntimeError("ticker column not found in constituents table")
+    if "name" not in df.columns:
+        df["name"] = df["ticker"]
+    if "sector" not in df.columns:
+        df["sector"] = ""
+    if "sub_industry" not in df.columns:
+        df["sub_industry"] = ""
+
+    # yfinance uses "-" for class shares (BRK.B → BRK-B)
+    df["ticker"] = df["ticker"].astype(str).str.replace(".", "-", regex=False).str.strip()
+    return df[["ticker", "name", "sector", "sub_industry"]]
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
-def _fetch_sp500_constituents() -> pd.DataFrame:
-    """Scrape current S&P 500 list from Wikipedia."""
-    resp = httpx.get(SP500_WIKI_URL, headers=_WIKI_HEADERS, follow_redirects=True, timeout=20.0)
+def _fetch_sp500_datahub() -> pd.DataFrame:
+    """Primary: fetch S&P 500 constituents from datahub.io."""
+    resp = httpx.get(
+        SP500_DATAHUB_URL,
+        headers=_DATAHUB_HEADERS,
+        follow_redirects=True,
+        timeout=20.0,
+    )
+    resp.raise_for_status()
+    df = pd.read_csv(StringIO(resp.text))
+    log.info("fetched %d S&P 500 constituents from datahub.io", len(df))
+    return _normalize_constituents_df(df)
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=10))
+def _fetch_sp500_wikipedia() -> pd.DataFrame:
+    """Secondary: scrape S&P 500 from Wikipedia."""
+    resp = httpx.get(
+        SP500_WIKI_URL,
+        headers=_WIKI_HEADERS,
+        follow_redirects=True,
+        timeout=20.0,
+    )
     resp.raise_for_status()
     tables = pd.read_html(StringIO(resp.text))
     df = None
@@ -32,38 +108,23 @@ def _fetch_sp500_constituents() -> pd.DataFrame:
             break
     if df is None:
         raise RuntimeError("could not find S&P 500 constituents table on Wikipedia")
-
-    col_map = {}
-    for c in df.columns:
-        cl = str(c).lower().strip()
-        if cl in ("symbol", "ticker"):
-            col_map[c] = "ticker"
-        elif cl in ("security", "company"):
-            col_map[c] = "name"
-        elif "sector" in cl and "sub" not in cl:
-            col_map[c] = "sector"
-        elif "sub" in cl and "industry" in cl:
-            col_map[c] = "sub_industry"
-    df = df.rename(columns=col_map)
-
-    if "ticker" not in df.columns:
-        raise RuntimeError("ticker column not found in S&P 500 Wikipedia table")
-    if "name" not in df.columns:
-        df["name"] = df["ticker"]
-    if "sector" not in df.columns:
-        df["sector"] = ""
-    if "sub_industry" not in df.columns:
-        df["sub_industry"] = ""
-
-    df["ticker"] = df["ticker"].astype(str).str.replace(".", "-", regex=False).str.strip()
     log.info("fetched %d S&P 500 constituents from Wikipedia", len(df))
-    return df[["ticker", "name", "sector", "sub_industry"]]
+    return _normalize_constituents_df(df)
+
+
+def _fetch_sp500_constituents() -> pd.DataFrame:
+    """Try datahub.io first, fall back to Wikipedia."""
+    try:
+        return _fetch_sp500_datahub()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("datahub.io primary source failed: %s — falling back to Wikipedia", exc)
+        return _fetch_sp500_wikipedia()
 
 
 def _recent_trading_dates(n: int) -> list[str]:
     """Return the last N trading dates (YYYY-MM-DD) by checking SPY data."""
     end = datetime.now()
-    start = end - timedelta(days=n + 15)  # extra buffer for holidays
+    start = end - timedelta(days=n + 15)
     spy = yf.download("SPY", start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"),
                        progress=False, auto_adjust=True)
     if spy.empty:
@@ -73,17 +134,11 @@ def _recent_trading_dates(n: int) -> list[str]:
 
 
 def fetch_all_markets() -> tuple[list[StockMarket], str]:
-    """Fetch S&P 500 constituents with latest market data.
-
-    Returns (stocks, most_recent_trading_date).
-    """
+    """Fetch S&P 500 constituents with latest market data."""
     constituents = _fetch_sp500_constituents()
     tickers = constituents["ticker"].tolist()
-    meta_by_ticker = {
-        row["ticker"]: row for _, row in constituents.iterrows()
-    }
+    meta_by_ticker = {row["ticker"]: row for _, row in constituents.iterrows()}
 
-    # Download latest 5 days of OHLCV for all tickers at once
     log.info("downloading market data for %d tickers...", len(tickers))
     data = yf.download(
         tickers,
@@ -97,7 +152,6 @@ def fetch_all_markets() -> tuple[list[StockMarket], str]:
     if data.empty:
         raise RuntimeError("yfinance returned empty data")
 
-    # Determine the most recent trading date
     trading_date = data.index[-1].strftime("%Y-%m-%d")
     prev_date = data.index[-2].strftime("%Y-%m-%d") if len(data.index) >= 2 else None
 
@@ -115,7 +169,6 @@ def fetch_all_markets() -> tuple[list[StockMarket], str]:
             volume = int(latest["Volume"]) if not pd.isna(latest["Volume"]) else 0
             trading_value = close * volume
 
-            # Single-day change
             change_pct = 0.0
             if prev_date and len(ticker_data) >= 2:
                 prev_close = float(ticker_data.iloc[-2]["Close"])
@@ -134,14 +187,13 @@ def fetch_all_markets() -> tuple[list[StockMarket], str]:
                     low=float(latest["Low"]) if not pd.isna(latest["Low"]) else 0,
                     volume=volume,
                     trading_value=trading_value,
-                    market_cap=0,  # filled below if available
+                    market_cap=0,
                     change_pct=change_pct,
                 )
             )
         except (KeyError, IndexError):
             continue
 
-    # Fetch market caps in batch via yfinance Tickers
     _enrich_market_caps(stocks)
 
     log.info("fetched %d S&P 500 stocks for %s", len(stocks), trading_date)
@@ -150,7 +202,7 @@ def fetch_all_markets() -> tuple[list[StockMarket], str]:
 
 def _enrich_market_caps(stocks: list[StockMarket]) -> None:
     """Best-effort market cap enrichment using yfinance fast_info."""
-    ticker_symbols = [s.ticker for s in stocks[:50]]  # top 50 only for speed
+    ticker_symbols = [s.ticker for s in stocks[:50]]
     try:
         tickers_obj = yf.Tickers(" ".join(ticker_symbols))
         for s in stocks:
@@ -167,13 +219,11 @@ def _enrich_market_caps(stocks: list[StockMarket]) -> None:
 
 
 def get_recent_trading_date() -> str:
-    """Return the most recent US trading date."""
     dates = _recent_trading_dates(1)
     return dates[-1]
 
 
 def get_past_trading_date(days_back: int) -> str:
-    """Return the trading date N trading days ago."""
     dates = _recent_trading_dates(days_back + 1)
     if len(dates) <= days_back:
         raise RuntimeError(f"could not find {days_back} past trading days")
