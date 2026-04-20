@@ -1,5 +1,41 @@
 [
   {
+    "date": "2026-04-20",
+    "narrative_tagline": "미중 무역 긴장 완화 기대감이 시장 전반의 리스크온 심리를 자극하며, 관세 피해주 및 공급망 민감 섹터(기술, 산업재, 소재)를 중심으로 단기 반등 매수세가 집중되고 있다.",
+    "top5": [
+      {
+        "ticker": "TTD",
+        "name": "Trade Desk (The)",
+        "sector": "Communication Services",
+        "change_pct_nd": 7.03
+      },
+      {
+        "ticker": "SWK",
+        "name": "Stanley Black & Decker",
+        "sector": "Industrials",
+        "change_pct_nd": 5.3
+      },
+      {
+        "ticker": "HPE",
+        "name": "Hewlett Packard Enterprise",
+        "sector": "Information Technology",
+        "change_pct_nd": 5.18
+      },
+      {
+        "ticker": "STLD",
+        "name": "Steel Dynamics",
+        "sector": "Materials",
+        "change_pct_nd": 4.51
+      },
+      {
+        "ticker": "DELL",
+        "name": "Dell Technologies",
+        "sector": "Information Technology",
+        "change_pct_nd": 3.91
+      }
+    ]
+  },
+  {
     "date": "2026-04-17",
     "narrative_tagline": "미중 무역 긴장 완화 기대감이 시장 전반의 리스크온 심리를 촉발하며, 관세 역풍에 눌려 있던 소비자 경기민감 섹터(크루즈·항공·중고차)와 저가 소매업체를 중심으로 강한 회복 매수세가 이틀 연속 집중되고 있다.",
     "top5": [
